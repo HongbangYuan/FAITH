@@ -1,0 +1,198 @@
+from core.methods.causal_trace.casual_trace import find_token_range
+from core.methods.causal_trace.causal_trace_tok_pred import decode_tokens
+import matplotlib.pyplot as plt
+from core.methods.causal_trace.path_patch import plot_path_patch, untuple
+
+
+def predict_from_input(model, inp):
+    out = model(**inp)["logits"]
+    probs = torch.softmax(out[:, -1], dim=1)
+    # p, preds = torch.max(probs, dim=1)
+    return probs
+
+
+def calculate_path_patch(
+        model,
+        tokenizer,
+        question_reference,
+        question_counter_factual,
+        uncompleted_answer,
+        ground_truth_token=None,
+        ground_truth_token_id=None,
+        threshold=0.1
+):
+    hidden_size = model.config.hidden_size
+    num_heads = model.config.num_attention_heads
+    head_dim = hidden_size // num_heads
+    num_hidden_layers = model.config.num_hidden_layers
+
+    orig_prompts = [
+        format_question_answer(question_reference, uncompleted_answer),
+        format_question_answer(question_counter_factual, uncompleted_answer),
+        format_question_answer(question_reference, uncompleted_answer),
+    ]
+    batch_input = tokenizer(orig_prompts, return_tensors="pt", padding=True)
+    batch_input = {
+        key: value.to(model.device) for key, value in batch_input.items()
+    }
+    with torch.no_grad():
+        probs = predict_from_input(model, batch_input)
+        p, preds = torch.max(probs, dim=1)
+        answers_t, base_scores = [[d[0], d[1]] for d in [preds, p]]
+    [predicted_token, counter_factual_token] = decode_tokens(tokenizer, answers_t)
+    if predicted_token == ground_truth_token:
+        raise ValueError(f"Predicted Token {predicted_token} = Ground Truth Token {ground_truth_token}!")
+    if counter_factual_token != ground_truth_token:
+        init_ground_truth_prob = probs[0, ground_truth_token_id].item()
+        counter_factual_ground_truth_prob = probs[1, ground_truth_token_id].item()
+        if counter_factual_ground_truth_prob - init_ground_truth_prob < threshold:
+            print(f"Token increase only from {init_ground_truth_prob} to {counter_factual_ground_truth_prob}.")
+            return None
+
+    _, end_of_question = find_token_range(tokenizer, batch_input["input_ids"][0], "".join(question_reference.split()))
+    pos = end_of_question - 2  # the previous token position before the question mark.
+    layers = [layername(model, L, 'self_attn.o_proj') for L in range(num_hidden_layers)]
+
+    differences = []
+    for selected_layer in tqdm(layers):
+        row = []
+        for selected_head in tqdm(range(num_heads), leave=False):
+            dim_start = selected_head * head_dim
+            dim_end = (selected_head + 1) * head_dim
+
+            def patch_rep(x, layer):
+                # before the o_proj layer:(batch_size,query_length,num_head * head_dim)
+                h = untuple(x)
+                # keeping all the heads frozen to there activations on reference data
+                h[2, pos, :] = h[0, pos, :]
+                if layer in selected_layer:
+                    # except for the sender head whose activation is on counter factual data
+                    h[2, pos, dim_start:dim_end] = h[1, pos, dim_start:dim_end]
+                return x
+
+            with torch.no_grad(), TraceDict(
+                    model,
+                    layers,
+                    edit_input=patch_rep,
+            ) as td:
+                out = model(
+                    **batch_input,
+                    output_hidden_states=True,
+                )  # logits:(batch_size,query_length,vocab_size)
+                probs = torch.softmax(out["logits"][:, -1], dim=1)
+                ground_truth_token_t = answers_t[1]
+                init_ground_truth_score = probs[0, ground_truth_token_t]
+                after_ground_truth_score = probs[2, ground_truth_token_t]
+                difference = (after_ground_truth_score - init_ground_truth_score).item()
+            row.append(difference)
+        differences.append(row)
+    differences = np.array(differences)
+    return dict(
+        differences=differences,
+        predicted_token=predicted_token,
+        counter_factual_token=counter_factual_token,
+        answers_t=np.array([elem.item() for elem in answers_t]),
+        base_scores=np.array([elem.item() for elem in base_scores]),
+    )
+
+
+if __name__ == '__main__':
+    import torch
+    import numpy as np
+    import os
+    from utils import read_json, load_llama_model_and_tokenizer, select, get_model_name_mapping, load_llama_tokenizer
+    from utils.nethook import TraceDict
+    from tqdm import tqdm
+    from core.methods.information_flow.saliency_score import format_question_answer
+    from core.methods.causal_trace.causal_trace_tok_pred import layername
+    from experiments.causal_trace.path_patch.single_tok_pred_nobel_prize import format_answer_from_sample
+    import argparse
+
+    parser = argparse.ArgumentParser(description='A simple program with argument parsing.')
+
+    # Add arguments
+    parser.add_argument('--model_size', type=int, default=7, choices=[7, 13], help='Choose model size (7 or 13)')
+    parser.add_argument('--debug', default=False, action='store_true')
+    parser.add_argument('--use_docker', action='store_true')
+    args = parser.parse_args()
+
+    model_size = f'{args.model_size}b'
+    debug = args.debug
+    use_docker = args.use_docker
+
+    subject_key = 'name'
+    answer_key = 'when_fp_question_model_answer'
+    question_key = 'when_fp_question'
+    fp_result_key = 'when_fp_answer_eval'
+    token_result_key = 'token_pred'
+
+    base_dir = '/home/zhuoran/hongbang/projects/HalluInducing' if not use_docker else '/mnt/userdata/projects/HalluInducing'
+    result_dir = f'{base_dir}/results/causal_trace/path_patch/NobelPrize/head_contributions_{model_size}'
+    result_figs_dir = f'{result_dir}/figs'
+    assert os.path.exists(result_figs_dir)
+    assert os.path.exists(result_dir)
+
+    dataset_file = f"{base_dir}/results/causal_trace/tok_pred/NobelPrize/llama2-{model_size}-chat_on_nobel_prize_when_fp_question_token_answer.json"
+    orig_samples = read_json(dataset_file)
+    samples = orig_samples
+
+    model_name = "llama2-{}-chat".format(model_size)
+    model_name_mapping = get_model_name_mapping(use_docker)
+    model_name_or_path = model_name_mapping[model_name]
+    print("Model name:", model_name)
+    model, tokenizer = load_llama_model_and_tokenizer(model_name_or_path)
+    # tokenizer = load_llama_tokenizer(model_name_or_path)
+
+    for i, sample in enumerate(samples):
+        sample_name = sample[subject_key].replace('/', '').replace(" ", '_')
+        filename = f"{result_dir}/{i}_{sample_name}.npz"
+
+        if sample["token_pred"][0]:
+            continue
+
+        if not os.path.isfile(filename) or i >= 24:
+            print(f"Processing sample {i} {sample_name}")
+            question_reference = sample[question_key]
+            question_counter_factual = f'For what specific contribution was {sample["name"]} awarded {sample["categoryFullName"]} in XXXX?'
+            uncompleted_answer = format_answer_from_sample(sample)
+            # print("Debug Usage")
+            false_year = str(sample["awardYear"] + 1)
+            true_year = str(sample["awardYear"])
+            true_token_ids = tokenizer([true_year], return_tensors='pt')["input_ids"][0][1:]
+            false_token_ids = tokenizer([false_year], return_tensors='pt')["input_ids"][0][1:]
+            prev_common = []
+            for true_token_id, false_token_id in zip(true_token_ids, false_token_ids):
+                if true_token_id != false_token_id:
+                    break
+                else:
+                    prev_common.append(true_token_id)
+            uncompleted_answer += tokenizer.decode(prev_common)
+            ground_truth_token_id = true_token_id
+            ground_truth_token = tokenizer.decode([ground_truth_token_id])
+
+            np_result = calculate_path_patch(
+                model,
+                tokenizer,
+                question_reference,
+                question_counter_factual,
+                uncompleted_answer,
+                ground_truth_token=ground_truth_token,
+                ground_truth_token_id=ground_truth_token_id,
+            )
+            if np_result is not None:
+                print(f"Saving to file {filename}")
+                np.savez(filename, **np_result)
+            else:
+                print(f"Skip this sample {i}!")
+                continue
+        else:
+            np_result = np.load(filename, allow_pickle=True)
+
+        print("Debug Usage")
+        # pdf_fig_name = f'{i}_{sample_name}.pdf'
+        # pdf_save_file = f'{result_figs_dir}/{pdf_fig_name}'
+        # pdf_title = f"{i}_{sample_name}"
+        # result = dict(np_result)
+        # plot_path_patch(result["differences"],title=pdf_title,save_path=pdf_save_file)
+
+    print("Finished Running!")
