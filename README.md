@@ -20,3 +20,14 @@ Here, you’ll find:
 2. A new `edit_input` feature we added for directly manipulate the inputs for any layer inside a model.
 
 This way, you don’t need to jump across multiple files—everything is wrapped in one place, making the workflow smooth and easy to adapt.
+
+## Where to start?
+
+ 
+To follow the workflow step by step:
+
+1. Start with [`experiments/causal_trace/path_patch/path_patch_nobel_prize.py`](experiments/causal_trace/path_patch/path_patch_nobel_prize.py) to see how we calculate the influence of each attention head.
+2. Then move to [`experiments/our_method/nobel_prize/analyze_path_patch_nobel_prize.py`](experiments/our_method/nobel_prize/analyze_path_patch_nobel_prize.py), where we identify the *false premise attention heads* based on their influence.
+3. Finally, check [`experiments/causal_trace/knock_out/knock_out_head_nobel_prize.py`](experiments/causal_trace/knock_out/knock_out_head_nobel_prize.py) to see how eliminating these heads helps mitigate hallucinations.
+
+ 
