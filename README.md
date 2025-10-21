@@ -1,5 +1,14 @@
 # FAITH
 
+📘 **Paper:** [*Whispers that Shake Foundations: Analyzing and Mitigating False Premise Hallucinations in Large Language Models*](https://arxiv.org/pdf/2402.19103)
+
+🏆 **Conference:** *EMNLP 2024*
+
+💻 **Code:** [github.com/HongbangYuan/FAITH](https://github.com/HongbangYuan/FAITH)
+
+📊 **Data:** [huggingface.co/datasets/HongbangYuan/FAITH](https://huggingface.co/datasets/HongbangYuan/FAITH)
+
+
 ## Description
 
 This repository contains the official code and data for our paper titled
